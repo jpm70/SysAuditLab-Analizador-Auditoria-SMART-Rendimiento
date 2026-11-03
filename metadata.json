@@ -1,0 +1,6 @@
+{
+  "name": "SysAudit Lab - Analizador de Auditoría, S.M.A.R.T. y Rendimiento",
+  "description": "Simulador educativo interactivo de telemetría de hardware, auditoría S.M.A.R.T., optimización de procesos (prioridad/afinidad) y redacción de partes técnicos de mantenimiento preventivo por Un Fantasma en el Sistema.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

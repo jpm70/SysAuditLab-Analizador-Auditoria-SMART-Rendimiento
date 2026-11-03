@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 520" width="1200" height="520">
+  <rect width="1200" height="520" fill="#050811" rx="12"/>
+  <rect x="1" y="1" width="1198" height="518" fill="none" stroke="#1e293b" stroke-width="2" rx="12"/>
+
+  <!-- Top Terminal Header -->
+  <rect x="0" y="0" width="1200" height="54" fill="#0f172a"/>
+  <line x1="0" y1="54" x2="1200" y2="54" stroke="#1e293b"/>
+  <text x="28" y="33" fill="#ffffff" font-family="sans-serif" font-size="14" font-weight="bold">Consola Interactiva de Diagnóstico de Bajo Nivel (PowerShell / SysAdmin CLI)</text>
+  <text x="890" y="33" fill="#38bdf8" font-family="monospace" font-size="12">Un Fantasma en el Sistema</text>
+
+  <!-- Quick Commands Bar -->
+  <rect x="0" y="55" width="1200" height="42" fill="#090d16"/>
+  <line x1="0" y1="97" x2="1200" y2="97" stroke="#1e293b"/>
+  <text x="28" y="80" fill="#94a3b8" font-family="monospace" font-size="11">Comandos rápidos:</text>
+  <rect x="155" y="64" width="110" height="24" rx="4" fill="#0f172a" stroke="#334155"/><text x="168" y="80" fill="#7dd3fc" font-family="monospace" font-size="11">tasklist /v</text>
+  <rect x="275" y="64" width="120" height="24" rx="4" fill="#0f172a" stroke="#334155"/><text x="288" y="80" fill="#7dd3fc" font-family="monospace" font-size="11">netstat -ano</text>
+  <rect x="405" y="64" width="160" height="24" rx="4" fill="#0f172a" stroke="#334155"/><text x="418" y="80" fill="#7dd3fc" font-family="monospace" font-size="11">smartctl -a /dev/sda</text>
+  <rect x="575" y="64" width="145" height="24" rx="4" fill="#0f172a" stroke="#334155"/><text x="588" y="80" fill="#7dd3fc" font-family="monospace" font-size="11">chkdsk D: /f /r</text>
+  <rect x="730" y="64" width="140" height="24" rx="4" fill="#0f172a" stroke="#334155"/><text x="742" y="80" fill="#7dd3fc" font-family="monospace" font-size="11">perfmon /report</text>
+
+  <!-- Console Output -->
+  <text x="28" y="130" fill="#38bdf8" font-family="monospace" font-size="13" font-weight="bold">PS C:\Windows\System32&gt; netstat -ano</text>
+  <text x="28" y="154" fill="#cbd5e1" font-family="monospace" font-size="12">Conexiones activas (Auditoría de sockets TCP/UDP):</text>
+  <text x="28" y="174" fill="#94a3b8" font-family="monospace" font-size="12">  Proto  Dirección local        Dirección remota          Estado           PID   Proceso Asociado</text>
+  <text x="28" y="194" fill="#f87171" font-family="monospace" font-size="12" font-weight="bold">  TCP    192.168.1.45:54912     185.220.101.44:4443       ESTABLISHED      6640  SyncCloud_Updater_tmp.exe [▲ SOSPECHOSO 860 Mbps]</text>
+  <text x="28" y="214" fill="#cbd5e1" font-family="monospace" font-size="12">  TCP    127.0.0.1:49664        127.0.0.1:49665           ESTABLISHED      604   csrss.exe</text>
+
+  <text x="28" y="254" fill="#38bdf8" font-family="monospace" font-size="13" font-weight="bold">PS C:\Windows\System32&gt; taskkill /f /pid 6640</text>
+  <text x="28" y="278" fill="#34d399" font-family="monospace" font-size="12" font-weight="bold">CORRECTO: Se envió la señal de terminación al proceso "SyncCloud_Updater_tmp.exe" con PID 6640. Recursos liberados.</text>
+
+  <text x="28" y="318" fill="#38bdf8" font-family="monospace" font-size="13" font-weight="bold">PS C:\Windows\System32&gt; smartctl -a /dev/drive0</text>
+  <text x="28" y="342" fill="#fde68a" font-family="monospace" font-size="12">SMART overall-health self-assessment test result: FAILED! (PRE-FAIL ALERT)</text>
+  <text x="28" y="364" fill="#cbd5e1" font-family="monospace" font-size="12">ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      RAW_VALUE</text>
+  <text x="28" y="384" fill="#fde68a" font-family="monospace" font-size="12">  5 (0x05) Reallocated_Sectors_Ct  0x0032     64    64     36 Pre-fail  48 sectores [ADVERTENCIA]</text>
+  <text x="28" y="404" fill="#f87171" font-family="monospace" font-size="12" font-weight="bold">197 (0xC5) Current_Pending_Sector  0x0032     32    32     30 Pre-fail  14 sectores inestables [CRÍTICO]</text>
+
+  <!-- Input Prompt -->
+  <rect x="0" y="464" width="1200" height="56" fill="#0f172a"/>
+  <line x1="0" y1="464" x2="1200" y2="464" stroke="#1e293b"/>
+  <text x="28" y="497" fill="#38bdf8" font-family="monospace" font-size="13" font-weight="bold">&gt; PS C:\SysAudit&gt;</text>
+  <text x="175" y="497" fill="#ffffff" font-family="monospace" font-size="13">chkdsk D: /f /r_</text>
+  <rect x="1070" y="476" width="102" height="32" rx="6" fill="#38bdf8"/>
+  <text x="1096" y="497" fill="#090d16" font-family="sans-serif" font-size="12" font-weight="bold">Ejecutar</text>
+</svg>
