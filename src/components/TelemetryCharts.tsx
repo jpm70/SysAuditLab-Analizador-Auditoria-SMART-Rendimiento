@@ -226,8 +226,8 @@ export const TelemetryCharts: React.FC<TelemetryChartsProps> = ({
               </svg>
               {latest.isThrashing && (
                 <div className="absolute top-1.5 left-2 right-2 flex items-center justify-between text-[11px] font-mono text-red-300 bg-red-950/90 border border-red-800/80 px-2 py-0.5 rounded">
-                  <span>▲ PAGEFILE.SYS SATURADO</span>
-                  <span>Fuga Activa</span>
+                  <span>▲ PAGINACIÓN INTENSA</span>
+                  <span>RAM al {latest.ramPercent.toFixed(0)} %</span>
                 </div>
               )}
             </div>
@@ -245,9 +245,9 @@ export const TelemetryCharts: React.FC<TelemetryChartsProps> = ({
               </span>
             </div>
             <div className="flex justify-between text-slate-400">
-              <span>Estado de Reserva Heap:</span>
+              <span>Archivo de paginación:</span>
               <span className={latest.isThrashing ? 'text-red-400' : 'text-emerald-400'}>
-                {latest.isThrashing ? 'Degradación por Fuga' : 'Estable'}
+                {latest.isThrashing ? 'Uso intensivo' : 'Uso normal'}
               </span>
             </div>
           </div>
@@ -310,8 +310,8 @@ export const TelemetryCharts: React.FC<TelemetryChartsProps> = ({
               </svg>
               {latest.diskLatencyMs >= 150 && (
                 <div className="absolute top-1.5 left-2 right-2 flex items-center justify-between text-[11px] font-mono text-red-300 bg-red-950/90 border border-red-800/80 px-2 py-0.5 rounded">
-                  <span>▲ COLA I/O BLOQUEADA</span>
-                  <span>Reintentos LBA</span>
+                  <span>▲ LATENCIA DE DISCO ALTA</span>
+                  <span>{latest.diskLatencyMs.toFixed(0)} ms</span>
                 </div>
               )}
             </div>
@@ -331,7 +331,7 @@ export const TelemetryCharts: React.FC<TelemetryChartsProps> = ({
                 onClick={() => onSelectTab('smart')}
                 className="text-sky-400 hover:text-sky-300 underline font-sans font-medium text-xs whitespace-nowrap"
               >
-                Inspeccionar Sectores →
+                Ver datos S.M.A.R.T. →
               </button>
             </div>
           </div>

@@ -1,9 +1,19 @@
-import React, { useState, useMemo } from 'react';
-import { SmartDrive, SmartAttribute } from '../types/telemetry';
+import React, { useState, useMemo, useEffect } from 'react';
+import { SmartDrive, SmartAttribute, SmartHealthStatus } from '../types/telemetry';
+import {
+  NVME,
+  driveTemperature,
+  fanTempDelta as fanDelta,
+  isNvme,
+  nvmeCriticalWarning,
+  shortSelfTest,
+  temperatureId,
+  temperatureStatus,
+} from '../engine/smart';
 import {
   HardDrive,
   RefreshCw,
-  Wrench,
+  ShieldAlert,
   Info,
   Grid,
   Play,
@@ -11,8 +21,29 @@ import {
 
 interface SmartAuditorProps {
   drives: SmartDrive[];
-  onRemapPendingSectors: (driveId: string) => void;
   fanProfile: 'silent' | 'balanced' | 'performance';
+  /** En modo examen no se muestra la interpretación de cada atributo. */
+  guidedMode: boolean;
+}
+
+const SEVERITY: Record<SmartHealthStatus, number> = { NOMINAL: 0, ADVERTENCIA: 1, CRÍTICO: 2 };
+
+/** Valor y estado de un atributo con la temperatura actual (la ventilación cambia la temperatura y el aviso crítico NVMe). */
+function liveAttr(d: SmartDrive, a: SmartAttribute, tempC: number): { value: number; status: SmartHealthStatus } {
+  if (a.idHex === temperatureId(d)) return { value: tempC, status: temperatureStatus(d, tempC) };
+  if (isNvme(d) && a.idHex === NVME.criticalWarning) {
+    const cw = nvmeCriticalWarning(d, tempC);
+    return { value: cw, status: cw ? 'CRÍTICO' : 'NOMINAL' };
+  }
+  return { value: a.rawDecimal, status: a.status };
+}
+
+/** Estado de la unidad: el peor de sus atributos con la temperatura actual. */
+function liveDriveStatus(d: SmartDrive, tempC: number): SmartHealthStatus {
+  return d.attributes.reduce<SmartHealthStatus>((worst, a) => {
+    const st = liveAttr(d, a, tempC).status;
+    return SEVERITY[st] > SEVERITY[worst] ? st : worst;
+  }, 'NOMINAL');
 }
 
 interface LbaBlock {
@@ -24,8 +55,8 @@ interface LbaBlock {
 
 export const SmartAuditor: React.FC<SmartAuditorProps> = ({
   drives,
-  onRemapPendingSectors,
   fanProfile,
+  guidedMode,
 }) => {
   const [selectedDriveId, setSelectedDriveId] = useState<string>(drives[0]?.id || 'drive-0');
   const [selectedAttrHex, setSelectedAttrHex] = useState<string | null>(null);
@@ -36,20 +67,26 @@ export const SmartAuditor: React.FC<SmartAuditorProps> = ({
   const [selectedBlockIndex, setSelectedBlockIndex] = useState<number | null>(null);
 
   const activeDrive = drives.find((d) => d.id === selectedDriveId) || drives[0];
+
+  // Al cambiar de caso, el resultado de un autotest anterior ya no corresponde a estas unidades
+  useEffect(() => {
+    setSelfTestResult(null);
+    setSelectedAttrHex(null);
+    setSelectedBlockIndex(null);
+  }, [drives]);
   const activeAttr: SmartAttribute | undefined =
     activeDrive?.attributes.find((a) => a.idHex === selectedAttrHex) ||
     activeDrive?.attributes.find((a) => a.status !== 'NOMINAL') ||
     activeDrive?.attributes[0];
 
-  const fanTempDelta = fanProfile === 'performance' ? -9 : fanProfile === 'silent' ? +5 : 0;
+  const fanTempDelta = fanDelta(fanProfile);
 
   // Build deterministic 128-block LBA surface map from drive S.M.A.R.T. attributes
   const lbaBlocks: LbaBlock[] = useMemo(() => {
     if (!activeDrive) return [];
-    const reallocCount =
-      activeDrive.attributes.find((a) => a.idHex === '05')?.rawDecimal || 0;
-    const pendingCount =
-      activeDrive.attributes.find((a) => a.idHex === 'C5')?.rawDecimal || 0;
+    // En NVMe no hay sectores reasignados ni pendientes como en ATA (el 05h es la vida útil consumida)
+    const reallocCount = isNvme(activeDrive) ? 0 : activeDrive.attributes.find((a) => a.idHex === '05')?.rawDecimal || 0;
+    const pendingCount = isNvme(activeDrive) ? 0 : activeDrive.attributes.find((a) => a.idHex === 'C5')?.rawDecimal || 0;
 
     const visualRealloc = Math.min(18, Math.ceil(reallocCount / 4));
     const visualPending = Math.min(12, Math.ceil(pendingCount / 2));
@@ -68,6 +105,7 @@ export const SmartAuditor: React.FC<SmartAuditorProps> = ({
         state = 'reallocated_05';
         latencyMs = 18 + (i % 4) * 4;
       } else if (
+        !isNvme(activeDrive) &&
         (reallocCount > 0 || activeDrive.overallStatus !== 'NOMINAL') &&
         (i === 39 || i === 43 || i === 66 || i === 95 || i === 104)
       ) {
@@ -92,16 +130,7 @@ export const SmartAuditor: React.FC<SmartAuditorProps> = ({
     setSelfTestResult(null);
     setTimeout(() => {
       setSelfTestRunning(false);
-      const hasCritical = activeDrive.attributes.some((a) => a.status === 'CRÍTICO');
-      if (hasCritical) {
-        setSelfTestResult(
-          'Test Corto S.M.A.R.T. completado con código 0x07 (Error de elemento de lectura LBA / Alerta Térmica). Se recomienda respaldo inmediato antes de cualquier operación intensiva.'
-        );
-      } else {
-        setSelfTestResult(
-          'Test Corto S.M.A.R.T. completado sin errores eléctricos ni de lectura (Código 0x00).'
-        );
-      }
+      setSelfTestResult(shortSelfTest(activeDrive).text);
     }, 650);
   };
 
@@ -124,9 +153,10 @@ export const SmartAuditor: React.FC<SmartAuditorProps> = ({
 
   if (!activeDrive) return null;
 
-  const currentDriveTemp = Math.max(28, activeDrive.baseTempC + fanTempDelta);
-  const pendingAttr = activeDrive.attributes.find((a) => a.idHex === 'C5');
-  const hasPendingSectors = pendingAttr && pendingAttr.rawDecimal > 0;
+  const currentDriveTemp = driveTemperature(activeDrive, fanTempDelta);
+  const nvme = isNvme(activeDrive);
+  const pendingAttr = nvme ? undefined : activeDrive.attributes.find((a) => a.idHex === 'C5');
+  const hasPendingSectors = Boolean(pendingAttr && pendingAttr.rawDecimal > 0);
   const inspectedBlock =
     selectedBlockIndex !== null
       ? lbaBlocks[selectedBlockIndex]
@@ -140,17 +170,18 @@ export const SmartAuditor: React.FC<SmartAuditorProps> = ({
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {drives.map((drive) => {
           const isSelected = drive.id === activeDrive.id;
-          const driveTemp = Math.max(28, drive.baseTempC + fanTempDelta);
+          const driveTemp = driveTemperature(drive, fanTempDelta);
+          const live = liveDriveStatus(drive, driveTemp);
           const statusLabel =
-            drive.overallStatus === 'CRÍTICO'
-              ? '▲ CRÍTICO (RIESGO PRE-FALLO)'
-              : drive.overallStatus === 'ADVERTENCIA'
-              ? '◆ ADVERTENCIA S.M.A.R.T.'
-              : '● SALUD NOMINAL';
+            live === 'CRÍTICO'
+              ? '▲ CRÍTICO'
+              : live === 'ADVERTENCIA'
+              ? '◆ ADVERTENCIA'
+              : '● CORRECTO';
           const statusColor =
-            drive.overallStatus === 'CRÍTICO'
+            live === 'CRÍTICO'
               ? 'text-red-400'
-              : drive.overallStatus === 'ADVERTENCIA'
+              : live === 'ADVERTENCIA'
               ? 'text-amber-400'
               : 'text-emerald-400';
 
@@ -186,10 +217,10 @@ export const SmartAuditor: React.FC<SmartAuditorProps> = ({
               </div>
 
               <div className="mt-3 pt-3 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2 text-xs font-mono tabular-nums text-slate-300">
-                <span>Salud Estimada: {drive.healthPercent}%</span>
+                <span>{isNvme(drive) ? `Vida útil restante: ${drive.healthPercent}%` : `Salud estimada: ${drive.healthPercent}%`}</span>
                 <span>·</span>
-                <span className={driveTemp >= 65 ? 'text-red-400 font-semibold' : 'text-slate-300'}>
-                  Temp Sensor: {driveTemp}°C
+                <span className={temperatureStatus(drive, driveTemp) !== 'NOMINAL' ? 'text-red-400 font-semibold' : 'text-slate-300'}>
+                  Temperatura: {driveTemp} °C
                 </span>
                 <span>·</span>
                 <span>Encendido: {drive.powerOnHours} h</span>
@@ -212,7 +243,9 @@ export const SmartAuditor: React.FC<SmartAuditorProps> = ({
                   Tabla de Atributos S.M.A.R.T. — {activeDrive.model}
                 </h3>
                 <p className="text-xs text-slate-400 mt-0.5">
-                  Haz clic en cualquier fila para inspeccionar el significado físico del registro y su umbral de pre-fallo.
+                  {nvme
+                    ? 'NVMe no usa los atributos ATA (05, C5…): informa con el registro SMART/Health (log 02h). Haz clic en un campo para ver qué significa.'
+                    : 'Haz clic en una fila para ver qué mide el atributo y cómo se interpreta.'}
                 </p>
               </div>
               <div className="flex items-center gap-2">
@@ -226,18 +259,18 @@ export const SmartAuditor: React.FC<SmartAuditorProps> = ({
                   <span>{selfTestRunning ? 'Verificando...' : 'Autotest S.M.A.R.T.'}</span>
                 </button>
 
-                {hasPendingSectors && (
-                  <button
-                    type="button"
-                    onClick={() => onRemapPendingSectors(activeDrive.id)}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-600 hover:bg-amber-500 text-white transition-colors whitespace-nowrap"
-                  >
-                    <Wrench className="w-3.5 h-3.5" />
-                    <span>Forzar Remapeo LBA (Sectores C5 → 05)</span>
-                  </button>
-                )}
+
               </div>
             </div>
+
+            {hasPendingSectors && (
+              <div role="note" className="px-4 py-2.5 bg-amber-950/40 border-b border-amber-800/60 text-xs text-amber-200 flex items-start gap-2">
+                <ShieldAlert className="w-4 h-4 shrink-0 mt-0.5" />
+                <span>
+                  Hay {pendingAttr?.rawDecimal} sectores pendientes. No fuerces su reasignación ni pases <code>chkdsk /r</code>: el disco los reasigna al escribir encima, y lo que contienen se pierde. Primero se clona la unidad (ddrescue) y se sustituye.
+                </span>
+              </div>
+            )}
 
             {selfTestResult && (
               <div className="px-4 py-2.5 bg-slate-950 border-b border-slate-800 text-xs font-mono text-sky-300">
@@ -249,24 +282,24 @@ export const SmartAuditor: React.FC<SmartAuditorProps> = ({
               <table className="w-full text-left border-collapse">
                 <thead>
                   <tr className="border-b border-slate-800 text-[11px] font-medium text-slate-400 bg-slate-950/60">
-                    <th className="py-2.5 px-3">ID Hex</th>
-                    <th className="py-2.5 px-3">Atributo S.M.A.R.T.</th>
-                    <th className="py-2.5 px-2 text-right">Actual</th>
-                    <th className="py-2.5 px-2 text-right">Peor</th>
+                    <th className="py-2.5 px-3">{nvme ? 'Byte' : 'ID'}</th>
+                    <th className="py-2.5 px-3">{nvme ? 'Campo del registro de salud' : 'Atributo S.M.A.R.T.'}</th>
+                    {!nvme && <th className="py-2.5 px-2 text-right">Actual</th>}
+                    {!nvme && <th className="py-2.5 px-2 text-right">Peor</th>}
                     <th className="py-2.5 px-2 text-right">Umbral</th>
-                    <th className="py-2.5 px-3 text-right">Valor Crudo (Raw)</th>
-                    <th className="py-2.5 px-3 text-right">Diagnóstico</th>
+                    <th className="py-2.5 px-3 text-right">{nvme ? 'Valor' : 'Valor crudo (Raw)'}</th>
+                    <th className="py-2.5 px-3 text-right">Estado</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/70 text-xs">
                   {activeDrive.attributes.map((attr) => {
                     const isSelected = activeAttr?.idHex === attr.idHex;
+                    const live = liveAttr(activeDrive, attr, currentDriveTemp);
                     const displayRaw =
-                      attr.idHex === 'C2' ? currentDriveTemp : attr.rawDecimal;
-                    const displayStatus =
-                      attr.idHex === 'C2' && currentDriveTemp < 62
-                        ? 'NOMINAL'
-                        : attr.status;
+                      nvme && attr.idHex === NVME.criticalWarning
+                        ? `0x${live.value.toString(16).padStart(2, '0')}`
+                        : live.value;
+                    const displayStatus = live.status;
 
                     const statusText =
                       displayStatus === 'CRÍTICO'
@@ -293,28 +326,33 @@ export const SmartAuditor: React.FC<SmartAuditorProps> = ({
                         }`}
                       >
                         <td className="py-2.5 px-3 font-mono font-bold text-sky-400">
-                          0x{attr.idHex}
+                          {nvme ? parseInt(attr.idHex, 16) : `0x${attr.idHex}`}
                         </td>
                         <td className="py-2.5 px-3">
                           <div className="font-medium text-slate-100">{attr.spanishName}</div>
                           <div className="text-[11px] font-mono text-slate-400">
-                            {attr.name} · {attr.isCriticalPreFail ? 'Pre-Fail' : 'Old-Age'}
+                            {attr.name}
+                            {!nvme && ` · ${attr.isCriticalPreFail ? 'Pre-fail' : 'Old_age'}`}
                           </div>
                         </td>
-                        <td className="py-2.5 px-2 text-right font-mono tabular-nums text-slate-200">
-                          {attr.current}
-                        </td>
+                        {!nvme && (
+                          <td className="py-2.5 px-2 text-right font-mono tabular-nums text-slate-200">
+                            {attr.current}
+                          </td>
+                        )}
+                        {!nvme && (
+                          <td className="py-2.5 px-2 text-right font-mono tabular-nums text-slate-400">
+                            {attr.worst}
+                          </td>
+                        )}
                         <td className="py-2.5 px-2 text-right font-mono tabular-nums text-slate-400">
-                          {attr.worst}
-                        </td>
-                        <td className="py-2.5 px-2 text-right font-mono tabular-nums text-slate-400">
-                          {attr.threshold}
+                          {attr.threshold > 0 ? `${attr.threshold}${nvme ? ` ${attr.unit}` : ''}` : '—'}
                         </td>
                         <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-200">
                           <div>
-                            {displayRaw} {attr.unit || ''}
+                            {displayRaw} {nvme && attr.idHex === NVME.criticalWarning ? '' : attr.unit || ''}
                           </div>
-                          <div className="text-[10px] text-slate-500">0x{attr.rawHex}</div>
+                          {!nvme && <div className="text-[10px] text-slate-500">0x{attr.rawHex}</div>}
                         </td>
                         <td className={`py-2.5 px-3 text-right font-mono tabular-nums ${statusColor}`}>
                           {statusText}
@@ -327,7 +365,12 @@ export const SmartAuditor: React.FC<SmartAuditorProps> = ({
             </div>
           </div>
 
-          {/* Interactive LBA Surface Block Scanner */}
+          {/* Interactive LBA Surface Block Scanner (solo discos ATA: un NVMe no tiene superficie) */}
+          {nvme ? (
+            <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 text-xs text-slate-400 leading-relaxed">
+              Un NVMe no tiene platos ni sectores que se reasignen como un disco mecánico: su salud se lee en el registro de arriba (aviso crítico, reserva disponible, vida útil consumida y errores de integridad).
+            </div>
+          ) : (
           <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5 space-y-4">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-800 pb-3">
               <div className="flex items-center gap-2.5">
@@ -416,6 +459,7 @@ export const SmartAuditor: React.FC<SmartAuditorProps> = ({
               )}
             </div>
           </div>
+          )}
         </div>
 
         {/* Right 4 cols: Pedagogical S.M.A.R.T. Attribute Interpreter */}
@@ -427,24 +471,26 @@ export const SmartAuditor: React.FC<SmartAuditorProps> = ({
                   INTÉRPRETE TÉCNICO DE TELEMETRÍA S.M.A.R.T.
                 </p>
                 <h4 className="text-base font-bold text-white mt-1">
-                  ID 0x{activeAttr.idHex} — {activeAttr.spanishName}
+                  {nvme ? `Byte ${parseInt(activeAttr.idHex, 16)}` : `ID 0x${activeAttr.idHex}`} — {activeAttr.spanishName}
                 </h4>
                 <p className="text-xs font-mono text-slate-400 mt-0.5">{activeAttr.name}</p>
               </div>
 
-              <div className="grid grid-cols-3 gap-2 bg-slate-950 p-3 rounded-lg border border-slate-800 font-mono text-center tabular-nums">
+              <div className={`grid ${nvme ? 'grid-cols-2' : 'grid-cols-3'} gap-2 bg-slate-950 p-3 rounded-lg border border-slate-800 font-mono text-center tabular-nums`}>
+                {!nvme && (
+                  <div>
+                    <div className="text-[10px] text-slate-400">Normalizado</div>
+                    <div className="text-sm font-bold text-white mt-0.5">{activeAttr.current}</div>
+                  </div>
+                )}
                 <div>
-                  <div className="text-[10px] text-slate-400">Normalizado</div>
-                  <div className="text-sm font-bold text-white mt-0.5">{activeAttr.current}</div>
+                  <div className="text-[10px] text-slate-400">Umbral</div>
+                  <div className="text-sm font-bold text-amber-300 mt-0.5">{activeAttr.threshold > 0 ? activeAttr.threshold : '—'}</div>
                 </div>
                 <div>
-                  <div className="text-[10px] text-slate-400">Umbral Fallo</div>
-                  <div className="text-sm font-bold text-amber-300 mt-0.5">{activeAttr.threshold}</div>
-                </div>
-                <div>
-                  <div className="text-[10px] text-slate-400">Valor Crudo</div>
+                  <div className="text-[10px] text-slate-400">{nvme ? 'Valor' : 'Valor crudo'}</div>
                   <div className="text-sm font-bold text-sky-300 mt-0.5">
-                    {activeAttr.idHex === 'C2' ? currentDriveTemp : activeAttr.rawDecimal}
+                    {liveAttr(activeDrive, activeAttr, currentDriveTemp).value}
                   </div>
                 </div>
               </div>
@@ -454,7 +500,11 @@ export const SmartAuditor: React.FC<SmartAuditorProps> = ({
                   <Info className="w-4 h-4 text-sky-400 shrink-0" />
                   <span>Cómo interpretar este parámetro en auditoría:</span>
                 </div>
-                <p>{activeAttr.explanation}</p>
+                <p>
+                  {guidedMode
+                    ? activeAttr.explanation
+                    : 'Modo examen: interpreta tú el valor comparándolo con el umbral, con los otros atributos y con lo que muestra la telemetría.'}
+                </p>
               </div>
 
               <div className="bg-slate-950 border border-slate-800 rounded-lg p-3.5 text-xs text-slate-300 space-y-1.5">
@@ -466,7 +516,7 @@ export const SmartAuditor: React.FC<SmartAuditorProps> = ({
                   <strong>Umbral (Threshold)</strong> conforme la unidad envejece. Sin embargo, en los atributos{' '}
                   <code className="text-sky-300">0x05</code> (Sectores Reasignados) y{' '}
                   <code className="text-sky-300">0xC5</code> (Sectores Pendientes), cualquier{' '}
-                  <strong>Valor Crudo (Raw) mayor que 0</strong> es una alerta temprana de fallo físico superficial o NAND que exige respaldo inmediato.
+                  <strong>valor crudo mayor que 0</strong> es una alerta temprana de fallo físico que exige respaldo inmediato, aunque smartctl marque C5 como Old_age y la unidad siga diciendo PASSED. En NVMe se miran el aviso crítico, la reserva disponible, la vida útil consumida y los errores de integridad.
                 </p>
               </div>
             </div>

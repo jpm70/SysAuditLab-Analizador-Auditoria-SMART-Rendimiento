@@ -26,6 +26,10 @@ interface TechnicalReportViewProps {
   scenario: DiagnosticScenario;
   report: TechnicalReport;
   onChangeReport: (updated: TechnicalReport) => void;
+  /** Nota de la primera evaluación del intento (la que cuenta). */
+  firstScore: number | null;
+  /** Si las pistas del modo guiado han estado a la vista en algún momento. */
+  guidedUsed: boolean;
   evaluation: EvaluationBreakdown | null;
   onEvaluate: () => void;
   actionLogs: ActionLogEntry[];
@@ -35,6 +39,8 @@ export const TechnicalReportView: React.FC<TechnicalReportViewProps> = ({
   scenario,
   report,
   onChangeReport,
+  firstScore,
+  guidedUsed,
   evaluation,
   onEvaluate,
   actionLogs,
@@ -49,24 +55,27 @@ export const TechnicalReportView: React.FC<TechnicalReportViewProps> = ({
     onChangeReport({ ...report, selectedPreventiveActions: updated });
   };
 
+  // La plantilla solo pone las cabeceras y tus intervenciones: la causa y la recomendación las escribes tú
   const handleInsertTemplate = () => {
     const logSummary =
       actionLogs.length > 0
-        ? actionLogs.map((l) => `- [${l.timestamp}] ${l.detail}`).join('\n')
-        : '- Sin intervenciones registradas aún en el administrador de procesos.';
+        ? [...actionLogs].reverse().map((l) => `- [${l.timestamp}] ${l.detail}`).join('\n')
+        : '- Sin intervenciones registradas aún.';
 
     const template = `DICTAMEN DE AUDITORÍA PREVENTIVA (${scenario.code} - ${scenario.workstationModel}):
 1. SÍNTOMAS Y TELEMETRÍA OBSERVADA:
-Se verificó el equipo bajo carga encontrando anomalías en los subsistemas monitorizados.
+
 
 2. INTERVENCIONES DE ESTABILIZACIÓN EJECUTADAS:
 ${logSummary}
 
-3. RECOMENDACIÓN DE MANTENIMIENTO PREVENTIVO:
-${scenario.expectedReport.sampleTechnicalConclusion}`;
+3. CAUSA RAÍZ Y RECOMENDACIÓN DE MANTENIMIENTO PREVENTIVO:
+`;
 
-    onChangeReport({ ...report, technicalNotes: template });
+    onChangeReport({ ...report, technicalNotes: report.technicalNotes.trim() ? `${report.technicalNotes.trim()}\n\n${template}` : template });
   };
+
+  const modeLabel = guidedUsed ? 'Modo guiado (con pistas a la vista en algún momento)' : 'Modo examen (sin pistas)';
 
   const buildPlainTextReport = () => {
     const bottleneckLabel =
@@ -91,6 +100,7 @@ Técnico / Alumno: ${report.technicianName || 'Alumno de Laboratorio'}
 Escenario Auditado: ${scenario.code} — ${scenario.title}
 Equipo: ${scenario.workstationModel} (${scenario.cpuModel}, ${scenario.ramTotalGb} GB RAM)
 Fecha: ${new Date().toLocaleString('es-ES')}
+Modo de trabajo: ${modeLabel}
 --------------------------------------------------------------------
 1. DIAGNÓSTICO DE CUELLO DE BOTELLA PRINCIPAL:
 ${bottleneckLabel}
@@ -115,7 +125,7 @@ ${
 ${report.technicalNotes || '(Sin observaciones adicionales)'}
 --------------------------------------------------------------------
 CALIFICACIÓN DE LABORATORIO: ${
-      evaluation ? `${evaluation.totalScore}/100 (${evaluation.gradeLabel})` : 'Pendiente de evaluar'
+      firstScore !== null ? `${firstScore}/100 (primer intento)` : 'Pendiente de evaluar'
     }
 ====================================================================`;
   };
@@ -127,7 +137,9 @@ CALIFICACIÓN DE LABORATORIO: ${
     const a = document.createElement('a');
     a.href = url;
     a.download = `Parte_Tecnico_${scenario.code}_${report.ticketId}.txt`;
+    document.body.appendChild(a);
     a.click();
+    a.remove();
     URL.revokeObjectURL(url);
   };
 
@@ -310,14 +322,15 @@ CALIFICACIÓN DE LABORATORIO: ${
               onClick={handleInsertTemplate}
               className="text-xs text-sky-400 hover:text-sky-300 underline whitespace-nowrap"
             >
-              Insertar estructura con mis intervenciones
+              Insertar cabeceras y mis intervenciones
             </button>
           </div>
           <textarea
             rows={5}
             value={report.technicalNotes}
             onChange={(e) => onChangeReport({ ...report, technicalNotes: e.target.value })}
-            placeholder="Describe los síntomas iniciales, qué procesos huérfanos o fugas detectaste, los valores crudos S.M.A.R.T. observados y por qué prescribes estas medidas preventivas..."
+            placeholder="Describe los síntomas, qué procesos causaban el problema y por qué, los valores S.M.A.R.T. que has visto y por qué prescribes estas medidas..."
+            aria-label="Dictamen técnico"
             className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs font-mono text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-sky-500"
           />
         </div>
@@ -364,9 +377,9 @@ CALIFICACIÓN DE LABORATORIO: ${
                 Rúbrica de Evaluación Formativa
               </h4>
             </div>
-            {evaluation && (
+            {firstScore !== null && (
               <span className="font-mono text-lg font-bold tabular-nums text-sky-400">
-                {evaluation.totalScore} / 100 pts
+                {firstScore} / 100 pts
               </span>
             )}
           </div>
@@ -377,13 +390,16 @@ CALIFICACIÓN DE LABORATORIO: ${
                 ¿Cómo se evalúa tu intervención en el simulador?
               </p>
               <p>
-                1. <strong>Estabilización en Vivo (40 pts):</strong> Finalizar procesos huérfanos, reiniciar servicios con fuga de memoria o bucle I/O, equilibrar la afinidad de CPU (0–7) y corregir la prioridad o curva PWM.
+                1. <strong>Estabilización (40 pts):</strong> resolver cada proceso problemático con la acción adecuada (finalizar, reiniciar un servicio o corregir prioridad y afinidad) y dejar el equipo estable y sin estrangulamiento térmico. Finalizar procesos que funcionaban bien, o el trabajo del usuario cuando bastaba con reconfigurarlo, resta puntos.
               </p>
               <p>
-                2. <strong>Precisión Diagnóstica S.M.A.R.T. y Sensores (30 pts):</strong> Identificar correctamente el cuello de botella, el estado de sectores ID 05/C5 y el fenómeno térmico o de paginación.
+                2. <strong>Diagnóstico (30 pts):</strong> causa raíz, dictamen S.M.A.R.T. y lectura térmica y de memoria.
               </p>
               <p>
-                3. <strong>Medidas Preventivas y Parte Técnico (30 pts):</strong> Seleccionar las acciones preventivas adecuadas y redactar las conclusiones técnicas.
+                3. <strong>Parte técnico (30 pts):</strong> las medidas preventivas que necesita el caso (las que sobran restan) y un dictamen escrito por ti de al menos 80 caracteres.
+              </p>
+              <p>
+                Solo cuenta la <strong>primera</strong> evaluación de cada intento; después puedes volver a evaluar para repasar, pero la nota no cambia.
               </p>
             </div>
           ) : (
@@ -410,8 +426,16 @@ CALIFICACIÓN DE LABORATORIO: ${
                 </div>
               </div>
 
-              <div className="text-xs font-mono text-slate-300">
-                Nivel alcanzado: <strong className="text-white">{evaluation.gradeLabel}</strong>
+              <div className="text-xs font-mono text-slate-300 space-y-1">
+                <div>
+                  Nivel alcanzado: <strong className="text-white">{evaluation.gradeLabel}</strong>
+                </div>
+                <div className="text-slate-400">{modeLabel}</div>
+                {firstScore !== null && evaluation.totalScore !== firstScore && (
+                  <div className="text-amber-300">
+                    Revisión: {evaluation.totalScore} / 100. La nota que cuenta es la del primer intento ({firstScore}).
+                  </div>
+                )}
               </div>
 
               {/* Detailed Feedback List */}
@@ -436,6 +460,11 @@ CALIFICACIÓN DE LABORATORIO: ${
                     </div>
                   </div>
                 ))}
+              </div>
+
+              <div className="bg-slate-950 border border-slate-800 rounded-lg p-3.5 text-xs text-slate-300 space-y-1.5">
+                <div className="font-semibold text-slate-100">Conclusión de referencia</div>
+                <p className="leading-relaxed">{scenario.expectedReport.sampleTechnicalConclusion}</p>
               </div>
             </div>
           )}
