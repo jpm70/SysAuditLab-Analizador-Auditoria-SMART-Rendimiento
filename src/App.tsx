@@ -10,6 +10,17 @@ import {
   EvaluationBreakdown,
 } from './types/telemetry';
 import { DIAGNOSTIC_SCENARIOS } from './data/scenarios';
+import { computeTelemetrySnapshot } from './engine/telemetry';
+import { evaluate } from './engine/evaluation';
+import {
+  changePriority,
+  killProcess,
+  restartService,
+  setAffinity,
+  toggleCore,
+  type KilledRecord,
+  type LogDraft,
+} from './engine/processes';
 import { TelemetryCharts } from './components/TelemetryCharts';
 import { ProcessManager } from './components/ProcessManager';
 import { SmartAuditor } from './components/SmartAuditor';
@@ -29,162 +40,7 @@ import {
 
 type ActiveTab = 'telemetry' | 'smart' | 'terminal' | 'report' | 'guide';
 
-const PRIORITY_MULTIPLIER: Record<PriorityLevel, number> = {
-  Baja: 0.45,
-  'Por debajo de lo normal': 0.7,
-  Normal: 1.0,
-  'Por encima de lo normal': 1.25,
-  Alta: 1.55,
-  'Tiempo Real': 2.15,
-};
-
-const SCORES_STORAGE_KEY = 'sysaudit_lab_scores_v1';
-
-function computeTelemetrySnapshot(
-  tick: number,
-  processes: ProcessItem[],
-  drives: SmartDrive[],
-  scenario: DiagnosticScenario,
-  fanProfile: 'silent' | 'balanced' | 'performance'
-): TelemetryPoint {
-  const coreLoads = [2, 2, 2, 2, 2, 2, 2, 2];
-
-  let ramUsedMb = 1450; // Base OS kernel RAM
-  let diskReadMbps = 2;
-  let diskWriteMbps = 2;
-  let netRxMbps = 1;
-  let netTxMbps = 1;
-  let gpuPercent = 2;
-  let realtimeContentionPenalty = 0;
-
-  processes.forEach((proc) => {
-    const prioMult = PRIORITY_MULTIPLIER[proc.priority] || 1.0;
-    const effectiveCpu = proc.baseCpu * (proc.isProblematic ? prioMult : Math.min(1.15, prioMult));
-
-    // Distribute process CPU load across its assigned affinity cores
-    const assignedCores = proc.affinity.length > 0 ? proc.affinity : [0];
-    const perCoreShare = (effectiveCpu * 2.4) / assignedCores.length;
-    assignedCores.forEach((cIdx) => {
-      if (cIdx >= 0 && cIdx < 8) {
-        const jitter = Math.sin(tick * 0.9 + proc.pid + cIdx) * 2.5;
-        coreLoads[cIdx] = Math.min(100, Math.max(2, coreLoads[cIdx] + perCoreShare + jitter));
-      }
-    });
-
-    if (proc.priority === 'Tiempo Real' && proc.baseCpu > 20) {
-      realtimeContentionPenalty += 18;
-    }
-
-    ramUsedMb += proc.baseRamMb;
-    diskReadMbps += proc.baseDiskMbps * 0.65;
-    diskWriteMbps += proc.baseDiskMbps * 0.35;
-    netRxMbps += proc.baseNetMbps * 0.3;
-    netTxMbps += proc.baseNetMbps * 0.7;
-    gpuPercent += proc.gpuUsage;
-  });
-
-  const clampedCores = coreLoads.map((c) => Math.min(100, Math.max(3, c)));
-  const avgCoreLoad = clampedCores.reduce((acc, v) => acc + v, 0) / 8;
-  const maxCoreLoad = Math.max(...clampedCores);
-  const cpuTotal = Math.min(100, avgCoreLoad * 0.75 + maxCoreLoad * 0.25);
-
-  // Cooling & Thermal calculation
-  const fanCoolingFactor =
-    fanProfile === 'performance' ? 0.72 : fanProfile === 'balanced' ? 0.94 : 1.24;
-  const coreAsymmetryHeat = maxCoreLoad > 92 && avgCoreLoad < 65 ? 11 : 0;
-  const rawCpuTemp =
-    scenario.ambientTempC +
-    14 +
-    (cpuTotal * 0.52 + coreAsymmetryHeat + realtimeContentionPenalty * 0.4) *
-      scenario.coolerDegradationFactor *
-      fanCoolingFactor +
-    Math.sin(tick * 0.6) * 1.2;
-
-  const cpuTempC = Math.min(102, Math.max(34, rawCpuTemp));
-  const isThermalThrottling = cpuTempC >= 90;
-  const baseFreq = 4.6;
-  const cpuFreqGhz = isThermalThrottling
-    ? Math.max(1.85, baseFreq - (cpuTempC - 88) * 0.22)
-    : Math.min(5.1, 3.6 + (cpuTotal / 100) * 1.3);
-
-  // RAM & Pagefile Thrashing calculation
-  const ramUsedGb = Math.min(scenario.ramTotalGb * 0.99, ramUsedMb / 1024);
-  const ramPercent = Math.min(99.4, (ramUsedGb / scenario.ramTotalGb) * 100);
-  const isThrashing = ramPercent >= 89;
-
-  const pageFaultsPerSec = isThrashing
-    ? Math.round(1450 + (ramPercent - 88) * 320 + Math.abs(Math.sin(tick)) * 180)
-    : Math.round(45 + cpuTotal * 2.2);
-
-  if (isThrashing) {
-    diskReadMbps += 65;
-    diskWriteMbps += 95;
-  }
-
-  // Disk S.M.A.R.T. Pending Sector penalty
-  const hasUnremappedPendingSectors = drives.some(
-    (d) => !d.pendingRemapped && d.attributes.some((a) => a.idHex === 'C5' && a.rawDecimal > 0)
-  );
-  const hasActiveDiskLoopProcess = processes.some(
-    (p) => p.isProblematic && p.baseDiskMbps >= 60
-  );
-
-  const totalDiskMbps = diskReadMbps + diskWriteMbps;
-  let diskActivePercent = Math.min(100, totalDiskMbps / 2.4);
-  let diskLatencyMs = 4 + diskActivePercent * 0.35;
-
-  if (hasUnremappedPendingSectors && hasActiveDiskLoopProcess) {
-    diskActivePercent = Math.min(100, Math.max(96, diskActivePercent));
-    diskLatencyMs = 380 + Math.sin(tick * 1.1) * 45;
-  } else if (isThrashing) {
-    diskActivePercent = Math.min(100, Math.max(88, diskActivePercent));
-    diskLatencyMs = 165 + Math.sin(tick) * 25;
-  }
-
-  const clampedGpu = Math.min(100, Math.max(2, gpuPercent));
-  const gpuTempC = Math.min(
-    96,
-    scenario.ambientTempC + 12 + clampedGpu * 0.56 * fanCoolingFactor
-  );
-
-  // Overall System Stability Index (0 - 100%)
-  let penalty = 0;
-  if (isThermalThrottling) penalty += 28;
-  if (isThrashing) penalty += 26;
-  if (diskLatencyMs >= 150) penalty += 24;
-  if (realtimeContentionPenalty > 0) penalty += 18;
-  if (netRxMbps + netTxMbps > 450) penalty += 22;
-  if (clampedGpu > 80) penalty += 15;
-
-  const systemStability = Math.max(12, Math.min(100, Math.round(100 - penalty)));
-
-  const now = new Date();
-  const timeStr = now.toTimeString().split(' ')[0];
-
-  return {
-    timestamp: timeStr,
-    tick,
-    cpuTotal,
-    cpuCores: clampedCores,
-    cpuFreqGhz,
-    cpuTempC,
-    isThermalThrottling,
-    ramUsedGb,
-    ramTotalGb: scenario.ramTotalGb,
-    ramPercent,
-    pageFaultsPerSec,
-    isThrashing,
-    diskActivePercent,
-    diskReadMbps,
-    diskWriteMbps,
-    diskLatencyMs,
-    netRxMbps,
-    netTxMbps,
-    gpuPercent: clampedGpu,
-    gpuTempC,
-    systemStability,
-  };
-}
+const SCORES_STORAGE_KEY = 'sysaudit_lab_scores_v2';
 
 export default function App() {
   const [selectedScenarioId, setSelectedScenarioId] = useState<string>(
@@ -227,6 +83,13 @@ export default function App() {
   const [actionLogs, setActionLogs] = useState<ActionLogEntry[]>([]);
   const [kernelWarningMessage, setKernelWarningMessage] = useState<string | null>(null);
   const [evaluation, setEvaluation] = useState<EvaluationBreakdown | null>(null);
+  // Solo cuenta la primera evaluación del intento; las siguientes son de repaso
+  const [firstScore, setFirstScore] = useState<number | null>(null);
+  const [killed, setKilled] = useState<KilledRecord[]>([]);
+  const [injectedPids, setInjectedPids] = useState<number[]>([]);
+  // Modo guiado (pistas y valoración de cada acción) o examen (solo datos observables)
+  const [guidedMode, setGuidedMode] = useState<boolean>(currentScenario.difficulty !== 'Certificación');
+  const [guidedUsed, setGuidedUsed] = useState<boolean>(currentScenario.difficulty !== 'Certificación');
 
   const [report, setReport] = useState<TechnicalReport>({
     technicianName: '',
@@ -293,6 +156,12 @@ export default function App() {
     setActionLogs([]);
     setKernelWarningMessage(null);
     setEvaluation(null);
+    setFirstScore(null);
+    setKilled([]);
+    setInjectedPids([]);
+    const guided = scenario.difficulty !== 'Certificación';
+    setGuidedMode(guided);
+    setGuidedUsed(guided);
     setReport({
       technicianName: '',
       ticketId: `INC-${scenario.code}-2026`,
@@ -358,149 +227,62 @@ export default function App() {
     return () => clearInterval(interval);
   }, [isPaused, processes, drives, currentScenario, fanProfile]);
 
-  const handleKillProcess = (pid: number) => {
-    const target = processes.find((p) => p.pid === pid);
-    if (!target) return;
+  const log = (d: LogDraft) => appendLog(d.actionType, d.target, d.detail, d.impact);
 
-    if (target.category === 'system_critical') {
-      setKernelWarningMessage(
-        `Has intentado finalizar "${target.name}" (PID ${target.pid}). En un sistema real, terminar un proceso crítico del subsistema provoca un pantallazo azul inmediato (BSOD: CRITICAL_PROCESS_DIED). Revisa la columna de estado para identificar procesos huérfanos reales (sin padre vivo) o ejecutables no firmados.`
-      );
-      appendLog(
-        'ALERT',
-        target.name,
-        `Intento bloqueado de finalizar proceso crítico del Kernel ${target.name} (PID ${target.pid}).`,
-        'negative'
-      );
+  const handleKillProcess = (pid: number) => {
+    const result = killProcess(processes, pid);
+    if (!result) return;
+    log(result.log);
+    if (result.blocked) {
+      setKernelWarningMessage(result.warning);
       return;
     }
-
-    setProcesses((prev) => prev.filter((p) => p.pid !== pid));
-    appendLog(
-      'KILL',
-      target.name,
-      `Finalizado proceso ${target.name} (PID ${target.pid}). Recursos liberados: ${target.baseRamMb.toFixed(0)} MB RAM, ${target.baseCpu}% CPU.`,
-      target.isProblematic ? 'positive' : 'neutral'
-    );
+    setProcesses(result.processes);
+    setKilled((prev) => [...prev, result.killed]);
   };
 
   const handleRestartService = (pid: number) => {
-    const target = processes.find((p) => p.pid === pid);
-    if (!target) return;
-
-    setProcesses((prev) =>
-      prev.map((p) => {
-        if (p.pid !== pid) return p;
-        return {
-          ...p,
-          status: 'Ejecutando',
-          baseCpu: 4,
-          baseRamMb: 190,
-          memoryLeakRateMbPerSec: 0,
-          baseDiskMbps: 3,
-          priority: 'Normal',
-          isProblematic: false,
-          fixedByStudent: true,
-          educationalHint:
-            'Servicio reiniciado y estabilizado correctamente. El Heap de memoria fue liberado y el bucle de I/O ha cesado.',
-        };
-      })
-    );
-
-    appendLog(
-      'RESTART',
-      target.name,
-      `Reiniciado servicio ${target.name} (PID ${target.pid}). Fuga de memoria / bucle I/O purgado y consumo estabilizado.`,
-      'positive'
-    );
+    const result = restartService(processes, pid);
+    if (!result) return;
+    log(result.log);
+    if (result.ok) setProcesses(result.processes);
   };
 
   const handleChangePriority = (pid: number, newPriority: PriorityLevel) => {
-    const target = processes.find((p) => p.pid === pid);
-    if (!target) return;
-
-    setProcesses((prev) =>
-      prev.map((p) => {
-        if (p.pid !== pid) return p;
-        const isNowFixed =
-          newPriority !== 'Tiempo Real' &&
-          newPriority !== 'Alta' &&
-          (p.recommendedAction === 'lower_priority' ||
-            (p.recommendedAction === 'balance_affinity' && p.affinity.length >= 6));
-
-        return {
-          ...p,
-          priority: newPriority,
-          baseDiskMbps:
-            newPriority === 'Baja' && p.baseDiskMbps > 40 ? 12 : p.baseDiskMbps,
-          isProblematic: isNowFixed ? false : p.isProblematic,
-          fixedByStudent: isNowFixed ? true : p.fixedByStudent,
-        };
-      })
-    );
-
-    appendLog(
-      'PRIORITY',
-      target.name,
-      `Cambiada prioridad de ${target.name} (PID ${target.pid}) de "${target.priority}" a "${newPriority}".`,
-      newPriority === 'Tiempo Real' ? 'negative' : 'positive'
-    );
+    const result = changePriority(processes, pid, newPriority);
+    if (!result) return;
+    setProcesses(result.processes);
+    log(result.log);
   };
 
   const handleToggleCoreAffinity = (pid: number, coreIndex: number) => {
-    const target = processes.find((p) => p.pid === pid);
-    if (!target) return;
-
-    const exists = target.affinity.includes(coreIndex);
-    if (exists && target.affinity.length <= 1) return;
-
-    const nextAffinity = exists
-      ? target.affinity.filter((c) => c !== coreIndex)
-      : [...target.affinity, coreIndex].sort((a, b) => a - b);
-
-    handleSetAllCoresAffinity(pid, nextAffinity);
+    const result = toggleCore(processes, pid, coreIndex);
+    if (!result) return;
+    setProcesses(result.processes);
+    log(result.log);
   };
 
   const handleSetAllCoresAffinity = (pid: number, cores: number[]) => {
-    const target = processes.find((p) => p.pid === pid);
-    if (!target) return;
-
-    setProcesses((prev) =>
-      prev.map((p) => {
-        if (p.pid !== pid) return p;
-        const isNowBalanced =
-          cores.length >= 4 &&
-          p.priority !== 'Tiempo Real' &&
-          p.recommendedAction === 'balance_affinity';
-        return {
-          ...p,
-          affinity: cores,
-          isProblematic: isNowBalanced ? false : p.isProblematic,
-          fixedByStudent: isNowBalanced ? true : p.fixedByStudent,
-        };
-      })
-    );
-
-    appendLog(
-      'AFFINITY',
-      target.name,
-      `Reasignada afinidad de CPU para ${target.name} (PID ${target.pid}) a núcleos [${cores.join(', ')}].`,
-      cores.length >= 4 ? 'positive' : 'neutral'
-    );
+    const result = setAffinity(processes, pid, cores);
+    if (!result) return;
+    setProcesses(result.processes);
+    log(result.log);
   };
 
   const handleInjectFault = (faultType: 'memory_leak' | 'orphan_io' | 'cpu0_realtime') => {
-    const randomPid = Math.floor(7200 + Math.random() * 2500);
+    const used = new Set(processes.map((p) => p.pid));
+    let randomPid = Math.floor(7200 + Math.random() * 2500);
+    while (used.has(randomPid)) randomPid += 4;
     let newProc: ProcessItem;
 
     if (faultType === 'orphan_io') {
       newProc = {
         pid: randomPid,
         ppid: 3102,
-        parentName: 'BackupTask_Old.exe (Cerrado)',
+        parentName: 'BackupTask.exe (finalizado)',
         parentAlive: false,
-        name: `Robocopy_Orphan_${randomPid}.exe`,
-        description: 'Copia en bucle huérfana saturando cola de disco',
+        name: 'Robocopy.exe',
+        description: 'Copia con /MIR que se quedó en bucle reintentando archivos bloqueados tras cerrarse la tarea que la lanzó',
         user: 'Alumno_Lab',
         path: 'C:\\Windows\\System32\\Robocopy.exe',
         signed: true,
@@ -518,7 +300,7 @@ export default function App() {
         isProblematic: true,
         recommendedAction: 'kill',
         educationalHint:
-          'Anomalía inyectada en vivo: Proceso huérfano saturando el ancho de banda I/O de disco. Finalízalo desde el inspector o con taskkill.',
+          'Incidente añadido: una copia que sigue viva al cerrarse la tarea que la lanzó y satura el disco. Finalízala desde el inspector o con taskkill.',
       };
     } else if (faultType === 'memory_leak') {
       newProc = {
@@ -526,8 +308,8 @@ export default function App() {
         ppid: 788,
         parentName: 'services.exe',
         parentAlive: true,
-        name: `LogCollector_Leak_${randomPid}.exe`,
-        description: 'Servicio de recolección con fuga activa de punteros en Heap (+45 MB/s)',
+        name: 'LogCollector.exe',
+        description: 'Servicio de recogida de registros con una fuga de memoria (+45 MB/s)',
         user: 'SYSTEM',
         path: 'C:\\Program Files\\AuditTools\\LogCollector.exe',
         signed: true,
@@ -545,7 +327,7 @@ export default function App() {
         isProblematic: true,
         recommendedAction: 'restart_service',
         educationalHint:
-          'Anomalía inyectada en vivo: Servicio con fuga de memoria activa (+45 MB/s). Reinicia el servicio o finalízalo antes de provocar Thrashing.',
+          'Incidente añadido: servicio con una fuga de memoria activa (+45 MB/s). Reinícialo antes de que el sistema empiece a paginar.',
       };
     } else {
       newProc = {
@@ -553,8 +335,8 @@ export default function App() {
         ppid: 2104,
         parentName: 'explorer.exe',
         parentAlive: true,
-        name: `StressEncoder_RT_${randomPid}.exe`,
-        description: 'Hilo de cálculo bloqueando Core 0 en prioridad Tiempo Real',
+        name: 'StressEncoder.exe',
+        description: 'Codificador de vídeo fijado en el núcleo 0 con prioridad Tiempo Real',
         user: 'Alumno_Lab',
         path: 'C:\\Users\\Alumno\\Desktop\\StressEncoder.exe',
         signed: false,
@@ -571,65 +353,16 @@ export default function App() {
         affinity: [0],
         isProblematic: true,
         recommendedAction: 'balance_affinity',
+        recommendedPriority: 'Normal',
         educationalHint:
-          'Anomalía inyectada en vivo: Proceso fijado en Tiempo Real únicamente sobre CPU 0. Rebaja su prioridad a Normal y reparte la afinidad a los núcleos 0–7.',
+          'Incidente añadido: proceso en Tiempo Real fijado al núcleo 0. Ponlo en Normal y reparte su afinidad entre los núcleos 0-7.',
       };
     }
 
     setProcesses((prev) => [newProc, ...prev]);
+    setInjectedPids((prev) => [...prev, newProc.pid]);
     setSelectedPid(newProc.pid);
-    appendLog(
-      'ALERT',
-      newProc.name,
-      `Inyectado incidente de entrenamiento: ${newProc.name} (PID ${newProc.pid}).`,
-      'negative'
-    );
-  };
-
-  const handleRemapPendingSectors = (driveId: string) => {
-    const targetDrive = drives.find((d) => d.id === driveId);
-    if (!targetDrive) return;
-
-    setDrives((prev) =>
-      prev.map((d) => {
-        if (d.id !== driveId) return d;
-        const pendingCount =
-          d.attributes.find((a) => a.idHex === 'C5')?.rawDecimal || 0;
-        return {
-          ...d,
-          pendingRemapped: true,
-          attributes: d.attributes.map((attr) => {
-            if (attr.idHex === 'C5') {
-              return {
-                ...attr,
-                rawDecimal: 0,
-                rawHex: '000000000000',
-                current: 100,
-                status: 'ADVERTENCIA',
-                explanation:
-                  'Sectores pendientes remapeados lógicamente al área de reserva (Spare Area). ¡Atención! La unidad sigue teniendo sectores reasignados físicos (ID 05) y requiere reemplazo preventivo.',
-              };
-            }
-            if (attr.idHex === '05') {
-              const newRealloc = attr.rawDecimal + pendingCount;
-              return {
-                ...attr,
-                rawDecimal: newRealloc,
-                status: 'CRÍTICO',
-              };
-            }
-            return attr;
-          }),
-        };
-      })
-    );
-
-    appendLog(
-      'SMART_REMAP',
-      targetDrive.model,
-      `Ejecutado remapeo lógico LBA en "${targetDrive.model}": sectores pendientes (0xC5) aislados en pista de reserva (0x05). Latencia de lectura desbloqueada.`,
-      'positive'
-    );
+    appendLog('ALERT', newProc.name, `Incidente de práctica añadido: ${newProc.name} (PID ${newProc.pid}).`, 'negative');
   };
 
   const handleChangeFanProfile = (profile: 'silent' | 'balanced' | 'performance') => {
@@ -650,179 +383,28 @@ export default function App() {
 
   const handleEvaluate = () => {
     const latestSnap = telemetryHistory[telemetryHistory.length - 1];
-    const feedbackItems: EvaluationBreakdown['feedbackItems'] = [];
-
-    let stabScore = 0;
-    const remainingProblematic = processes.filter((p) => p.isProblematic);
-    if (remainingProblematic.length === 0) {
-      stabScore += 28;
-      feedbackItems.push({
-        category: 'Optimización de Procesos y Tareas Huérfanas',
-        passed: true,
-        message:
-          'Excelente: Neutralizaste todos los procesos huérfanos, fugas de memoria y cuellos de botella de planificación.',
-      });
-    } else {
-      const fixedRatio =
-        (currentScenario.initialProcesses.filter((p) => p.isProblematic).length -
-          remainingProblematic.length) /
-        Math.max(
-          1,
-          currentScenario.initialProcesses.filter((p) => p.isProblematic).length
-        );
-      stabScore += Math.max(0, Math.round(fixedRatio * 24));
-      feedbackItems.push({
-        category: 'Optimización de Procesos Pendiente',
-        passed: false,
-        message: `Aún quedan ${remainingProblematic.length} procesos anómalos activos (${remainingProblematic
-          .map((p) => p.name)
-          .join(', ')}). Revisa su prioridad, afinidad o finalízalos.`,
-      });
-    }
-
-    if (latestSnap.systemStability >= 85 && !latestSnap.isThermalThrottling) {
-      stabScore += 12;
-      feedbackItems.push({
-        category: 'Estabilidad Térmica y Operativa',
-        passed: true,
-        message: `Índice de estabilidad en ${latestSnap.systemStability}% y temperaturas bajo control (${latestSnap.cpuTempC.toFixed(
-          0
-        )}°C).`,
-      });
-    } else {
-      stabScore += 4;
-      feedbackItems.push({
-        category: 'Estabilidad Térmica / Latencia',
-        passed: false,
-        message: `La estabilidad actual es del ${latestSnap.systemStability}% (CPU ${latestSnap.cpuTempC.toFixed(
-          0
-        )}°C). Si hay alerta térmica, activa el perfil de ventilación PWM al 100%.`,
-      });
-    }
-
-    let smartScore = 0;
-    if (report.primaryBottleneck === currentScenario.expectedReport.correctBottleneck) {
-      smartScore += 10;
-      feedbackItems.push({
-        category: 'Identificación de Cuello de Botella',
-        passed: true,
-        message: 'Identificaste con exactitud la causa raíz del cuello de botella del sistema.',
-      });
-    } else {
-      feedbackItems.push({
-        category: 'Identificación de Cuello de Botella',
-        passed: false,
-        message:
-          'El diagnóstico de cuello de botella seleccionado no coincide con la anomalía principal de este escenario.',
-      });
-    }
-
-    if (report.smartVerdict === currentScenario.expectedReport.correctSmartVerdict) {
-      smartScore += 10;
-      feedbackItems.push({
-        category: 'Dictamen de Sensores S.M.A.R.T.',
-        passed: true,
-        message: 'Interpretación impecable de los registros S.M.A.R.T. (ID 05, C5, C2, E7).',
-      });
-    } else {
-      feedbackItems.push({
-        category: 'Dictamen de Sensores S.M.A.R.T.',
-        passed: false,
-        message:
-          'Revisa la pestaña Auditoría S.M.A.R.T. para verificar si existen sectores pendientes (ID C5), alerta térmica (ID C2) o desgaste por paginación (ID E7).',
-      });
-    }
-
-    if (
-      report.thermalAndMemoryVerdict ===
-      currentScenario.expectedReport.correctThermalMemoryVerdict
-    ) {
-      smartScore += 10;
-      feedbackItems.push({
-        category: 'Diagnóstico Térmico y de Memoria',
-        passed: true,
-        message: 'Evaluación correcta del comportamiento térmico y del archivo de paginación.',
-      });
-    } else {
-      feedbackItems.push({
-        category: 'Diagnóstico Térmico y de Memoria',
-        passed: false,
-        message:
-          'La evaluación de temperatura/memoria seleccionada no refleja lo observado en las gráficas de telemetría.',
-      });
-    }
-
-    let reportScore = 0;
-    const reqActions = currentScenario.expectedReport.requiredPreventiveActions;
-    const matchedActions = reqActions.filter((id) =>
-      report.selectedPreventiveActions.includes(id)
-    );
-    const actionPoints = Math.round((matchedActions.length / reqActions.length) * 20);
-    reportScore += actionPoints;
-
-    if (matchedActions.length === reqActions.length) {
-      feedbackItems.push({
-        category: 'Plan de Mantenimiento Preventivo',
-        passed: true,
-        message: 'Has seleccionado todas las medidas preventivas clave para evitar la recurrencia del fallo.',
-      });
-    } else {
-      feedbackItems.push({
-        category: 'Plan de Mantenimiento Preventivo Incompleto',
-        passed: false,
-        message: `Seleccionaste ${matchedActions.length} de ${reqActions.length} medidas preventivas clave recomendadas para este caso.`,
-      });
-    }
-
-    if (report.technicalNotes.trim().length >= 50) {
-      reportScore += 10;
-      feedbackItems.push({
-        category: 'Redacción del Dictamen Técnico',
-        passed: true,
-        message: 'Parte técnico documentado con detalle profesional.',
-      });
-    } else {
-      feedbackItems.push({
-        category: 'Redacción del Dictamen Técnico',
-        passed: false,
-        message:
-          'El campo de observaciones técnicas es demasiado breve. Redacta tu dictamen o utiliza el botón de estructura asistida.',
-      });
-    }
-
-    const totalScore = stabScore + smartScore + reportScore;
-    const gradeLabel =
-      totalScore >= 90
-        ? 'Auditor Senior (Sobresaliente)'
-        : totalScore >= 75
-        ? 'Técnico Cualificado (Notable)'
-        : totalScore >= 55
-        ? 'Apto en Prácticas'
-        : 'En Entrenamiento (Requiere Revisión)';
-
-    setEvaluation({
-      systemStabilizationScore: stabScore,
-      smartAuditScore: smartScore,
-      preventiveReportScore: reportScore,
-      totalScore,
-      gradeLabel,
-      feedbackItems,
+    const result = evaluate({
+      scenario: currentScenario,
+      processes,
+      killed,
+      injectedProblemPids: injectedPids,
+      report,
+      latest: latestSnap,
     });
-
-    // Persist best score in localStorage
-    setSavedScores((prev) => {
-      const updated = {
-        ...prev,
-        [currentScenario.id]: Math.max(prev[currentScenario.id] || 0, totalScore),
-      };
-      try {
-        localStorage.setItem(SCORES_STORAGE_KEY, JSON.stringify(updated));
-      } catch {
-        // Ignore storage errors
-      }
-      return updated;
-    });
-
+    setEvaluation(result);
+    if (firstScore === null) {
+      setFirstScore(result.totalScore);
+      // Se guarda la mejor nota de primer intento de cada caso
+      setSavedScores((prev) => {
+        const updated = { ...prev, [currentScenario.id]: Math.max(prev[currentScenario.id] || 0, result.totalScore) };
+        try {
+          localStorage.setItem(SCORES_STORAGE_KEY, JSON.stringify(updated));
+        } catch {
+          // almacenamiento no disponible
+        }
+        return updated;
+      });
+    }
     setActiveTab('report');
   };
 
@@ -833,7 +415,7 @@ export default function App() {
   return (
     <div className="min-h-screen flex flex-col bg-[#090d16] text-slate-100">
       {/* Top Bar Contract: 3 Zones separated by gap-8 */}
-      <header className="sticky top-0 z-30 bg-slate-950/95 backdrop-blur border-b border-slate-800 px-6 py-3 flex items-center justify-between gap-8">
+      <header className="sticky top-0 z-30 bg-slate-950/95 backdrop-blur border-b border-slate-800 px-4 sm:px-6 py-3 flex items-center justify-between gap-3 sm:gap-8">
         {/* Zone 1: Brand lockup with user's Ghost-USB Logo & link to unfantasmaenelsistema.com */}
         <a
           href="https://www.unfantasmaenelsistema.com/"
@@ -851,14 +433,13 @@ export default function App() {
               }
             }}
             alt="Logo Un Fantasma en el Sistema"
-            referrerPolicy="no-referrer"
             className="w-9 h-9 object-contain rounded-lg bg-slate-900 border border-slate-800 p-0.5 shrink-0"
           />
-          <span>SysAudit Lab · Un Fantasma en el Sistema</span>
+          <span className="hidden sm:inline">SysAudit Lab · Un Fantasma en el Sistema</span>
         </a>
 
         {/* Zone 2: 5 Single-line Navigation Links */}
-        <nav className="hidden md:flex items-center gap-6 text-sm font-medium">
+        <nav className="hidden xl:flex items-center gap-6 text-sm font-medium">
           <button
             type="button"
             onClick={() => setActiveTab('telemetry')}
@@ -931,7 +512,7 @@ export default function App() {
       {/* Main Content Container */}
       <main className="flex-1 max-w-[1440px] w-full mx-auto px-4 sm:px-6 py-6 space-y-6">
         {/* Mobile Navigation Bar */}
-        <div className="flex md:hidden items-center gap-1 p-1 bg-slate-900 border border-slate-800 rounded-lg overflow-x-auto">
+        <div className="flex xl:hidden items-center gap-1 p-1 bg-slate-900 border border-slate-800 rounded-lg overflow-x-auto">
           <button
             type="button"
             onClick={() => setActiveTab('telemetry')}
@@ -1046,6 +627,23 @@ export default function App() {
                 <RotateCcw className="w-3.5 h-3.5" />
                 <span>Reiniciar Caso</span>
               </button>
+
+              <button
+                type="button"
+                aria-pressed={guidedMode}
+                onClick={() => {
+                  setGuidedMode((v) => !v);
+                  if (!guidedMode) setGuidedUsed(true);
+                }}
+                title="Modo guiado: pistas y valoración de cada acción. Modo examen: solo lo que se vería en un equipo real."
+                className={`inline-flex items-center gap-1.5 px-3 py-2.5 rounded-lg text-xs font-medium border transition-colors whitespace-nowrap ${
+                  guidedMode
+                    ? 'bg-sky-500/15 border-sky-500/40 text-sky-200'
+                    : 'bg-amber-500/15 border-amber-500/40 text-amber-200'
+                }`}
+              >
+                <span>{guidedMode ? 'Modo guiado (con pistas)' : 'Modo examen (sin pistas)'}</span>
+              </button>
             </div>
           </div>
 
@@ -1082,27 +680,29 @@ export default function App() {
           {/* Symptom & Early Alert Banner */}
           <div
             className={`rounded-lg p-3.5 border flex flex-col md:flex-row md:items-center justify-between gap-4 ${
-              activeAnomaliesCount > 0 || latestTelemetry.systemStability < 80
+              (guidedMode && activeAnomaliesCount > 0) || latestTelemetry.systemStability < 80
                 ? 'bg-amber-950/30 border-amber-700/50 text-amber-100'
                 : 'bg-emerald-950/30 border-emerald-700/50 text-emerald-100'
             }`}
           >
             <div className="flex items-start gap-3">
-              {activeAnomaliesCount > 0 || latestTelemetry.systemStability < 80 ? (
+              {(guidedMode && activeAnomaliesCount > 0) || latestTelemetry.systemStability < 80 ? (
                 <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
               ) : (
                 <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
               )}
               <div className="text-xs leading-relaxed">
                 <span className="font-semibold">
-                  {activeAnomaliesCount > 0
-                    ? `Alerta Temprana de Auditoría (${activeAnomaliesCount} anomalías de procesos activas): `
-                    : 'Subsistemas de Procesos Estabilizados: '}
+                  {!guidedMode
+                    ? 'Aviso del usuario: '
+                    : activeAnomaliesCount > 0
+                    ? `Alerta temprana (${activeAnomaliesCount} procesos causando problemas): `
+                    : 'Procesos estabilizados: '}
                 </span>
                 <span className="text-slate-300">{currentScenario.symptomSummary}</span>
               </div>
             </div>
-            <div className="flex items-center gap-2 shrink-0">
+            <div className="flex flex-wrap items-center gap-2 sm:shrink-0">
               {activeTab !== 'terminal' && (
                 <button
                   type="button"
@@ -1160,17 +760,14 @@ export default function App() {
             onSetAllCoresAffinity={handleSetAllCoresAffinity}
             onInjectFault={handleInjectFault}
             actionLogs={actionLogs}
+            guidedMode={guidedMode}
             kernelWarningMessage={kernelWarningMessage}
             onDismissKernelWarning={() => setKernelWarningMessage(null)}
           />
         )}
 
         {activeTab === 'smart' && (
-          <SmartAuditor
-            drives={drives}
-            onRemapPendingSectors={handleRemapPendingSectors}
-            fanProfile={fanProfile}
-          />
+          <SmartAuditor drives={drives} fanProfile={fanProfile} guidedMode={guidedMode} />
         )}
 
         {activeTab === 'terminal' && (
@@ -1179,9 +776,8 @@ export default function App() {
             processes={processes}
             drives={drives}
             latestTelemetry={latestTelemetry}
+            fanProfile={fanProfile}
             onKillProcess={handleKillProcess}
-            onRestartService={handleRestartService}
-            onRemapPendingSectors={handleRemapPendingSectors}
           />
         )}
 
@@ -1193,6 +789,8 @@ export default function App() {
             evaluation={evaluation}
             onEvaluate={handleEvaluate}
             actionLogs={actionLogs}
+            firstScore={firstScore}
+            guidedUsed={guidedUsed || guidedMode}
           />
         )}
 
@@ -1212,7 +810,6 @@ export default function App() {
                 }
               }}
               alt="Logo Un Fantasma en el Sistema"
-              referrerPolicy="no-referrer"
               className="w-7 h-7 object-contain rounded bg-slate-900 border border-slate-800 p-0.5"
             />
             <span>

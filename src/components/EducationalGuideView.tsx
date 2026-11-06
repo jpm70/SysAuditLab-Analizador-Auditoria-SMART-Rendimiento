@@ -40,27 +40,27 @@ const QUIZ_QUESTIONS: QuizQuestion[] = [
       '2. ¿Por qué nunca debe configurarse un proceso intensivo de usuario (ej. renderizador CAD o compresor) en prioridad "Tiempo Real" con afinidad restringida a CPU 0 y CPU 1?',
     options: [
       'Porque Windows borra automáticamente el archivo de paginación al usar Tiempo Real.',
-      'Porque la prioridad Tiempo Real se ejecuta por encima de hilos del kernel (ratón, red, E/S) y concentrar la carga en 2 núcleos provoca Thermal Throttling e inanición (starvation).',
+      'Porque sus hilos pasan por delante de casi todos los del sistema (entrada del ratón y el teclado, gestor de ventanas), que se quedan sin CPU, y concentrar la carga en 2 núcleos los calienta hasta el estrangulamiento térmico.',
       'Porque los núcleos 0 y 1 solo sirven para gráficos integrados.',
       'Porque el proceso pasa a ser huérfano inmediatamente.',
     ],
     correctIndex: 1,
     explanation:
-      'Correcto: La prioridad "Tiempo Real" adelanta incluso a los controladores de entrada y gestión del sistema operativo, y encerrar un proceso pesado en 2 núcleos concentra el calor y satura las interrupciones del Core 0.',
+      'Correcto: la clase "Tiempo Real" adelanta a casi todos los hilos del sistema, que esperan su turno (por eso el ratón da tirones). Las interrupciones en sí no se bloquean, porque se atienden por encima de cualquier hilo, pero el trabajo que generan sí espera. Y encerrar la carga en 2 núcleos concentra el calor.',
   },
   {
     id: 'q3',
     question:
-      '3. ¿Cómo se distingue técnicamente un Proceso Huérfano (Orphan Process) de un servicio con Fuga de Memoria (Memory Leak)?',
+      '3. En el Administrador de tareas ves un proceso cuyo padre ya no existe y un servicio cuya memoria crece sin parar. ¿Qué es cada cosa?',
     options: [
-      'El proceso huérfano ha perdido su proceso padre (PPID inexistente) tras un cierre anómalo; la fuga de memoria es un proceso activo cuyo consumo de Heap crece indefinidamente (+MB/s) sin liberar bloques.',
+      'El primero es un proceso cuyo padre terminó (en Windows no es un fallo por sí mismo, pero importa si debía haberse cerrado con él y sigue consumiendo); el segundo es una fuga de memoria: reserva RAM (+MB/s) sin liberarla.',
       'Son exactamente lo mismo, solo cambia el nombre en Linux y Windows.',
       'Un proceso huérfano solo consume red, mientras que la fuga de memoria solo afecta a la GPU.',
       'Los procesos huérfanos siempre pertenecen al usuario SYSTEM y no pueden finalizarse.',
     ],
     correctIndex: 0,
     explanation:
-      'Exacto: En un proceso huérfano el proceso padre (PPID) ya terminó pero el subproceso quedó colgado reteniendo recursos; en una fuga de memoria, el proceso reserva RAM continuamente sin liberarla, llevando al sistema al Thrashing de pagefile.sys.',
+      'Exacto: Windows no adopta los procesos sin padre como Linux, y muchos son normales (explorer.exe tampoco tiene padre vivo). El problema es el que debía cerrarse con su aplicación y sigue reteniendo recursos. La fuga de memoria, en cambio, crece sin liberar y acaba llevando al sistema a paginar contra pagefile.sys.',
   },
   {
     id: 'q4',
@@ -82,7 +82,7 @@ const QUIZ_QUESTIONS: QuizQuestion[] = [
       '5. ¿Qué efecto colateral provoca en un disco SSD NVMe sufrir "Thrashing" crónico del archivo de paginación (pagefile.sys) por culpa de una fuga de memoria RAM?',
     options: [
       'Aumenta la capacidad total del SSD al comprimir los bloques.',
-      'Dispara las escrituras en celdas NAND (TBW), acelerando el desgaste del atributo S.M.A.R.T. 0xE7 (Wear Leveling / Vida útil restante) y elevando la temperatura.',
+      'Dispara las escrituras en la memoria flash: suben Data Units Written y Percentage Used del registro de salud NVMe (y la temperatura).',
       'Desactiva la tarjeta de red para ahorrar energía.',
       'Convierte los sectores pendientes en memoria RAM caché.',
     ],
@@ -136,16 +136,16 @@ export const EducationalGuideView: React.FC = () => {
             </p>
             <ul className="space-y-2 text-xs text-slate-300 font-mono">
               <li>
-                <strong className="text-sky-300">ID 0x05 (Reallocated Sectors Count):</strong> Sectores físicos que fallaron y fueron redirigidos a la pista de reserva. Si sube día tras día, la superficie o celdas NAND se están degradando.
+                <strong className="text-sky-300">ATA 0x05 (Reallocated Sectors Count):</strong> sectores que fallaron y se sustituyeron por otros de reserva. Si sube día tras día, la superficie se está degradando.
               </li>
               <li>
-                <strong className="text-red-400">ID 0xC5 (Current Pending Sector Count):</strong> Sectores inestables esperando remapeo. Provocan que el disco se quede al 100% de actividad con latencias &gt;300ms cuando un indexador intenta leerlos.
+                <strong className="text-red-400">ATA 0xC5 (Current Pending Sector Count):</strong> sectores que no se pueden leer y esperan a reasignarse cuando se escriba en ellos (lo que contienen se pierde). Cada lectura provoca reintentos y latencias de cientos de milisegundos. smartctl los marca como Old_age, pero son de los mejores indicadores de fallo: con C5 &gt; 0, se clona el disco antes de nada.
               </li>
               <li>
-                <strong className="text-amber-300">ID 0xC2 (Temperature Celsius):</strong> En SSD NVMe PCIe 4.0, superar los 70°C activa el <em>Thermal Throttling</em> de la controladora, cayendo la velocidad a niveles de disco mecánico.
+                <strong className="text-amber-300">Temperatura (ATA 0xC2, NVMe «Temperature»):</strong> un NVMe que supera su temperatura de aviso (WCTEMP, entre 70 y 85 °C según el modelo) activa el bit 0x02 del aviso crítico y baja su velocidad para enfriarse.
               </li>
               <li>
-                <strong className="text-purple-300">ID 0xE7 (SSD Life Left / Wear Leveling):</strong> Mide el desgaste de ciclos P/E en memoria flash. Una fuga de RAM que abuse del archivo de paginación desgasta prematuramente el SSD.
+                <strong className="text-purple-300">Desgaste del SSD (NVMe «Percentage Used» y «Data Units Written»):</strong> NVMe no usa IDs de atributo como ATA; informa con su registro de salud (log 02h). Una fuga de RAM que obligue a paginar dispara las escrituras y gasta la vida útil.
               </li>
             </ul>
           </div>
@@ -154,14 +154,14 @@ export const EducationalGuideView: React.FC = () => {
           <div className="bg-slate-950 border border-slate-800 rounded-xl p-5 space-y-3">
             <div className="flex items-center gap-2.5 text-white font-semibold text-sm">
               <MemoryStick className="w-4 h-4 text-purple-400 shrink-0" />
-              <span>2. Fugas de Memoria, Tareas Huérfanas y Thrashing</span>
+              <span>2. Fugas de memoria, procesos que no se cerraron y Thrashing</span>
             </div>
             <p className="text-xs text-slate-300 leading-relaxed">
               Cuando un equipo se vuelve lento tras varias horas encendido, debemos distinguir tres patologías de procesos:
             </p>
             <ul className="space-y-2 text-xs text-slate-300">
               <li>
-                <strong className="text-white">Proceso Huérfano (Orphan Process):</strong> Subproceso cuyo proceso padre (<code className="font-mono text-sky-300">PPID</code>) ya se cerró o colapsó, pero el hijo sigue vivo consumiendo CPU, GPU o manteniendo archivos bloqueados. Solución: <em>Finalizar tarea</em>.
+                <strong className="text-white">Proceso que no se cerró:</strong> su padre (<code className="font-mono text-sky-300">PPID</code>) ya terminó y él sigue vivo consumiendo CPU, GPU o disco. En Windows tener el padre muerto no es un fallo (explorer.exe tampoco lo tiene vivo); lo es seguir consumiendo cuando debía haberse cerrado. Solución: <em>Finalizar tarea</em> y averiguar por qué no se cerró.
               </li>
               <li>
                 <strong className="text-white">Fuga de Memoria (Memory Leak):</strong> Un servicio reserva bloques en el <em>Heap</em> dinámicamente pero olvida liberarlos (<code className="font-mono text-red-400">+MB/s constante</code>). Solución temporal: <em>Reiniciar el servicio</em>; solución definitiva: <em>Actualizar/parchear el binario</em>.
@@ -277,8 +277,10 @@ export const EducationalGuideView: React.FC = () => {
                       <button
                         key={idx}
                         type="button"
+                        disabled={isAnswered}
                         onClick={() =>
-                          setSelectedAnswers((prev) => ({ ...prev, [q.id]: idx }))
+                          // Solo cuenta la primera respuesta de cada pregunta
+                          setSelectedAnswers((prev) => (q.id in prev ? prev : { ...prev, [q.id]: idx }))
                         }
                         className={`w-full text-left p-2.5 rounded-lg border text-xs transition-colors flex items-start gap-2.5 ${btnStyle}`}
                       >

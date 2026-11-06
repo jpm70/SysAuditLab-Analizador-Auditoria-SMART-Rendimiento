@@ -29,7 +29,12 @@ interface ProcessManagerProps {
   actionLogs: ActionLogEntry[];
   kernelWarningMessage: string | null;
   onDismissKernelWarning: () => void;
+  /** En modo examen solo se muestra lo que se vería en el Administrador de tareas. */
+  guidedMode: boolean;
 }
+
+/** Estado que se vería en un equipo real (sin diagnosticar). */
+const observableStatus = (p: ProcessItem) => (p.status === 'No responde (Colgado)' ? 'No responde' : 'En ejecución');
 
 const PRIORITY_LEVELS: PriorityLevel[] = [
   'Baja',
@@ -56,6 +61,7 @@ export const ProcessManager: React.FC<ProcessManagerProps> = ({
   actionLogs,
   kernelWarningMessage,
   onDismissKernelWarning,
+  guidedMode,
 }) => {
   const [filterMode, setFilterMode] = useState<FilterMode>('all');
   const [viewMode, setViewMode] = useState<'table' | 'tree'>('table');
@@ -66,7 +72,7 @@ export const ProcessManager: React.FC<ProcessManagerProps> = ({
   const filteredProcesses = useMemo(() => {
     return processes
       .filter((p) => {
-        if (filterMode === 'anomalies' && !p.isProblematic) return false;
+        if (filterMode === 'anomalies' && guidedMode && !p.isProblematic) return false;
         if (filterMode === 'orphans' && p.parentAlive) return false;
         if (filterMode === 'io_heavy' && p.baseDiskMbps < 20 && p.baseNetMbps < 20) return false;
         if (searchQuery.trim() !== '') {
@@ -101,7 +107,7 @@ export const ProcessManager: React.FC<ProcessManagerProps> = ({
         }
         return sortDesc ? valB - valA : valA - valB;
       });
-  }, [processes, filterMode, searchQuery, sortField, sortDesc]);
+  }, [processes, filterMode, searchQuery, sortField, sortDesc, guidedMode]);
 
   const selectedProcess = useMemo(
     () => processes.find((p) => p.pid === selectedPid) || filteredProcesses[0] || null,
@@ -177,6 +183,7 @@ export const ProcessManager: React.FC<ProcessManagerProps> = ({
                   >
                     Todos ({processes.length})
                   </button>
+                  {guidedMode && (
                   <button
                     type="button"
                     onClick={() => setFilterMode('anomalies')}
@@ -188,6 +195,7 @@ export const ProcessManager: React.FC<ProcessManagerProps> = ({
                   >
                     Anomalías ({processes.filter((p) => p.isProblematic).length})
                   </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => setFilterMode('orphans')}
@@ -197,7 +205,7 @@ export const ProcessManager: React.FC<ProcessManagerProps> = ({
                         : 'text-slate-400 hover:text-slate-200'
                     }`}
                   >
-                    Huérfanos ({processes.filter((p) => !p.parentAlive).length})
+                    Sin padre ({processes.filter((p) => !p.parentAlive).length})
                   </button>
                   <button
                     type="button"
@@ -315,9 +323,11 @@ export const ProcessManager: React.FC<ProcessManagerProps> = ({
                     ) : (
                       filteredProcesses.map((proc) => {
                         const isSelected = selectedProcess?.pid === proc.pid;
-                        const statePrefix = proc.isProblematic
+                        const statePrefix = !guidedMode
+                          ? `● ${observableStatus(proc)}`
+                          : proc.isProblematic
                           ? !proc.parentAlive
-                            ? '▲ HUÉRFANO'
+                            ? '▲ SIN PADRE'
                             : proc.memoryLeakRateMbPerSec > 0
                             ? '▲ FUGA RAM'
                             : '◆ CUELLO BOTELLA'
@@ -325,7 +335,11 @@ export const ProcessManager: React.FC<ProcessManagerProps> = ({
                           ? '● OPTIMIZADO'
                           : '● NOMINAL';
 
-                        const stateColor = proc.isProblematic
+                        const stateColor = !guidedMode
+                          ? proc.status === 'No responde (Colgado)'
+                            ? 'text-amber-300'
+                            : 'text-slate-400'
+                          : proc.isProblematic
                           ? 'text-red-400'
                           : proc.fixedByStudent
                           ? 'text-emerald-400'
@@ -355,7 +369,7 @@ export const ProcessManager: React.FC<ProcessManagerProps> = ({
                                   {statePrefix}
                                 </span>
                                 <span aria-hidden="true">·</span>
-                                <span className="truncate max-w-[230px]">{proc.description}</span>
+                                <span className="truncate max-w-[230px]">{guidedMode ? proc.description : proc.path}</span>
                               </div>
                             </td>
                             <td className="py-2.5 px-2 text-right font-mono tabular-nums text-slate-300">
@@ -399,7 +413,7 @@ export const ProcessManager: React.FC<ProcessManagerProps> = ({
                               <div
                                 className={
                                   proc.priority === 'Tiempo Real' ||
-                                  (proc.priority === 'Alta' && proc.isProblematic)
+                                  (guidedMode && proc.priority === 'Alta' && proc.isProblematic)
                                     ? 'text-amber-300 font-semibold'
                                     : 'text-slate-300'
                                 }
@@ -437,8 +451,8 @@ export const ProcessManager: React.FC<ProcessManagerProps> = ({
                         }
                       >
                         {group.parentAlive
-                          ? '● Proceso Padre Activo'
-                          : '▲ Proceso Padre Cerrado (Hijos Huérfanos)'}
+                          ? '● El proceso padre está en ejecución'
+                          : '◆ El proceso padre ya no existe'}
                       </span>
                     </div>
                     <div className="pl-4 space-y-1.5">
@@ -459,7 +473,7 @@ export const ProcessManager: React.FC<ProcessManagerProps> = ({
                               <span className="text-slate-500 mr-1.5">└─</span>
                               <span className="font-semibold text-white">{proc.name}</span>
                               <span className="text-slate-400 ml-2">
-                                (PID {proc.pid} · {proc.status})
+                                (PID {proc.pid} · {guidedMode ? proc.status : observableStatus(proc)})
                               </span>
                             </div>
                             <div className="shrink-0 tabular-nums text-[11px] text-slate-300">
@@ -489,7 +503,7 @@ export const ProcessManager: React.FC<ProcessManagerProps> = ({
                 onClick={() => onInjectFault('orphan_io')}
                 className="px-2.5 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-amber-300 border border-slate-700 transition-colors whitespace-nowrap"
               >
-                + Inyectar Huérfano I/O
+                + Copia en bucle (disco)
               </button>
               <button
                 type="button"
@@ -540,7 +554,7 @@ export const ProcessManager: React.FC<ProcessManagerProps> = ({
                       }`}
                     >
                       {selectedProcess.parentName}{' '}
-                      {!selectedProcess.parentAlive && '· ▲ PADRE INEXISTENTE (HUÉRFANO)'}
+                      {!selectedProcess.parentAlive && '· ya no existe'}
                     </span>
                   </div>
                   <div className="flex items-center justify-between">
@@ -559,7 +573,8 @@ export const ProcessManager: React.FC<ProcessManagerProps> = ({
                 </div>
               </div>
 
-              {/* Educational Hint Box */}
+              {/* Educational Hint Box (solo en modo guiado) */}
+              {guidedMode ? (
               <div
                 className={`rounded-lg p-3.5 border text-xs leading-relaxed ${
                   selectedProcess.isProblematic
@@ -582,6 +597,13 @@ export const ProcessManager: React.FC<ProcessManagerProps> = ({
                 </div>
                 <p>{selectedProcess.educationalHint}</p>
               </div>
+              ) : (
+                <div className="rounded-lg p-3.5 border text-xs leading-relaxed bg-slate-950 border-slate-800 text-slate-300">
+                  <p>
+                    <strong className="text-slate-100">Modo examen:</strong> decide con sus datos (padre, ruta, firma, consumo, prioridad y afinidad) si hay que dejarlo, reconfigurarlo, reiniciarlo o finalizarlo.
+                  </p>
+                </div>
+              )}
 
               {/* Control 1: Process Priority Level */}
               <div>
@@ -665,7 +687,7 @@ export const ProcessManager: React.FC<ProcessManagerProps> = ({
                   })}
                 </div>
                 <p className="text-[11px] text-slate-400 mt-1.5">
-                  Repartir hilos en múltiples núcleos reduce puntos calientes térmicos y evita ahogar las interrupciones del Core 0.
+                  Repartir los hilos entre varios núcleos reduce los puntos calientes y deja CPU libre para el resto del sistema.
                 </p>
               </div>
 
@@ -687,7 +709,7 @@ export const ProcessManager: React.FC<ProcessManagerProps> = ({
                     className="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-xs font-semibold bg-amber-600 hover:bg-amber-500 text-white transition-colors whitespace-nowrap"
                   >
                     <RotateCcw className="w-4 h-4" />
-                    <span>Reiniciar Servicio y Purgar Heap</span>
+                    <span>Reiniciar servicio</span>
                   </button>
                 )}
               </div>
@@ -708,7 +730,7 @@ export const ProcessManager: React.FC<ProcessManagerProps> = ({
             <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 max-h-40 overflow-y-auto space-y-2 font-mono text-xs">
               {actionLogs.length === 0 ? (
                 <p className="text-slate-500">
-                  Aún no has ejecutado intervenciones. Selecciona un proceso anómalo en la tabla para ajustar su afinidad, cambiar su prioridad o finalizar tareas huérfanas.
+                  Aún no hay intervenciones. Selecciona un proceso en la tabla para ver sus datos, cambiar su prioridad o su afinidad, reiniciarlo si es un servicio o finalizarlo.
                 </p>
               ) : (
                 actionLogs.map((log) => (
@@ -716,7 +738,9 @@ export const ProcessManager: React.FC<ProcessManagerProps> = ({
                     <span className="text-slate-500 tabular-nums shrink-0">[{log.timestamp}]</span>
                     <span
                       className={
-                        log.impact === 'positive'
+                        !guidedMode
+                          ? 'text-slate-300'
+                          : log.impact === 'positive'
                           ? 'text-emerald-400'
                           : log.impact === 'negative'
                           ? 'text-red-400'
